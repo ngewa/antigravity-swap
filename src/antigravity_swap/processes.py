@@ -48,9 +48,18 @@ class Instance:
         return False
 
 
-def _is_agy(argv0: str) -> bool:
-    name = Path(argv0.replace("\\", "/")).name.lower()
-    return name in ("agy", "agy.exe")
+def _is_agy_name(name: str) -> bool:
+    n = Path(name.replace("\\", "/")).name.lower()
+    return n in ("agy", "agy.exe", "agy.real")
+
+
+def _extract_agy_argv(argv: list[str]) -> list[str] | None:
+    if not argv:
+        return None
+    for i, a in enumerate(argv):
+        if _is_agy_name(a):
+            return argv[i:]
+    return None
 
 
 def list_instances() -> list[Instance]:
@@ -84,10 +93,11 @@ def _linux() -> list[Instance]:
         if not p.name.isdigit():
             continue
         try:
-            argv = [a.decode(errors="replace") for a in (p / "cmdline").read_bytes().split(b"\0") if a]
+            raw_argv = [a.decode(errors="replace") for a in (p / "cmdline").read_bytes().split(b"\0") if a]
         except OSError:
             continue
-        if not argv or not _is_agy(argv[0]):
+        argv = _extract_agy_argv(raw_argv)
+        if not argv:
             continue
         try:
             cwd = os.readlink(p / "cwd")
@@ -101,6 +111,11 @@ def _linux() -> list[Instance]:
                 started = boot + int(fields[19]) / hz
         except (OSError, ValueError, IndexError):
             pass
+        if started is None:
+            try:
+                started = p.stat().st_mtime
+            except OSError:
+                pass
         out.append(Instance(int(p.name), argv, cwd, started))
     return out
 
@@ -116,7 +131,8 @@ def _macos() -> list[Instance]:
         if len(parts) < 3 or not parts[0].isdigit():
             continue
         argv = parts[2].split()
-        if not argv or not _is_agy(argv[0]):
+        argv = _extract_agy_argv(argv)
+        if not argv:
             continue
         pid = int(parts[0])
         cwd = None

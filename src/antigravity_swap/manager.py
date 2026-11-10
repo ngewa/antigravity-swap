@@ -208,7 +208,11 @@ class Manager:
                     status, err = renew_status
                     break
             try:
-                reading = fetch(cred.access_token or "", (rec.get("reading") or {}).get("project"))
+                try:
+                    reading = fetch(cred.access_token or "", (rec.get("reading") or {}).get("project"),
+                                    cred_raw=cred.raw if cred else None, is_active=is_active)
+                except TypeError:
+                    reading = fetch(cred.access_token or "", (rec.get("reading") or {}).get("project"))
                 status, err = "ok", None
                 break
             except UsageError as e:

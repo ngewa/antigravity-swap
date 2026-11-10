@@ -150,17 +150,39 @@ def instance_rows(mgr: Manager, reg: Registry, active: Account | None) -> list[d
     return rows
 
 
+def shorten_path(p: str | None) -> str:
+    if not p:
+        return "?"
+    try:
+        home = str(Path.home().resolve())
+        p_res = str(Path(p).resolve())
+        if p_res == home:
+            return "~"
+        if p_res.startswith(home + "/"):
+            return "~" + p_res[len(home):]
+    except Exception:
+        pass
+    home_raw = str(Path.home())
+    if p == home_raw:
+        return "~"
+    if p.startswith(home_raw + "/"):
+        return "~" + p[len(home_raw):]
+    return p
+
+
 def print_instances(rows: list[dict], out: TextIO) -> None:
     if not rows:
         return
     g = style.glyphs()
     groups: dict[tuple, int] = {}
     for r in rows:
-        key = (r["mode"], r["cwd"] or "?", r["accountNumber"], r["account"])
+        disp_cwd = shorten_path(r["cwd"])
+        key = (r["mode"], disp_cwd, r["accountNumber"], r["account"])
         groups[key] = groups.get(key, 0) + 1
     out.write("\n" + style.bold("Running instances:") + "\n")
     width = max(len(k[1]) for k in groups)
+    who_width = max(len(f"{k[2]}: {k[3]}" if k[2] else "account unknown (started before a switch)") for k in groups)
     for (mode, cwd, num, name), n in sorted(groups.items(), key=lambda kv: (kv[0][1], kv[0][0])):
         who = f"{num}: {name}" if num else "account unknown (started before a switch)"
         count = style.dim(f"({n} session{'s' if n != 1 else ''})")
-        out.write(f"  {style.dim(g['dot'])} {mode:<5}  {cwd.ljust(width)}  {who}  {count}\n")
+        out.write(f"  {style.dim(g['dot'])} {mode:<5}  {cwd.ljust(width)}  {who.ljust(who_width)}  {count}\n")

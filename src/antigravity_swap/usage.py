@@ -15,9 +15,14 @@ that this endpoint does not report; ``aswap exec`` catches that one when it happ
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 from antigravity_swap import __version__
 from antigravity_swap.credentials import parse_rfc3339
@@ -48,8 +53,51 @@ def _call(host: str, path: str, body: dict, token: str) -> dict:
         return json.loads(r.read().decode("utf-8"))
 
 
-def fetch(token: str, project: str | None = None) -> dict:
+def fetch_via_agy(cred_raw: str | None = None, is_active: bool = False, gdir: Path | None = None) -> dict | None:
+    """Run agy -p /usage --output-format json to get exact quota including Gemini."""
+    try:
+        from antigravity_swap.agy import find_agy, dir_args
+        agy_cmd = find_agy()
+    except Exception:
+        return None
+
+    tmp_dir = None
+    try:
+        if is_active:
+            cmd = agy_cmd + ["-p", "/usage", "--output-format", "json"]
+        elif gdir is not None:
+            cmd = agy_cmd + dir_args(gdir) + ["-p", "/usage", "--output-format", "json"]
+        elif cred_raw:
+            tmp_dir = Path(tempfile.mkdtemp(prefix="aswap-usage-"))
+            tok_dir = tmp_dir / "antigravity-cli"
+            tok_dir.mkdir(parents=True, exist_ok=True)
+            (tok_dir / "antigravity-oauth-token").write_text(cred_raw, encoding="utf-8")
+            cmd = agy_cmd + dir_args(tmp_dir) + ["-p", "/usage", "--output-format", "json"]
+        else:
+            return None
+
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=30)
+        if r.returncode == 0 and r.stdout.strip():
+            data = json.loads(r.stdout.strip())
+            groups = normalize(data)
+            if groups:
+                return {"ts": time.time(), "project": "agy-cli", "host": "agy", "groups": groups}
+    except Exception:
+        pass
+    finally:
+        if tmp_dir and tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    return None
+
+
+def fetch(token: str, project: str | None = None, cred_raw: str | None = None,
+          is_active: bool = False, gdir: Path | None = None) -> dict:
     """Fetch and normalize one account's quota. Raises UsageError."""
+    agy_reading = fetch_via_agy(cred_raw=cred_raw, is_active=is_active, gdir=gdir)
+    if agy_reading:
+        return agy_reading
+
     last: UsageError | None = None
     for host in HOSTS:
         proj = project
@@ -77,25 +125,34 @@ def fetch(token: str, project: str | None = None) -> dict:
 
 
 def normalize(resp: dict) -> list[dict]:
+    raw_groups = resp.get("groups")
+    if raw_groups is None and "command" in resp:
+        raw_groups = resp.get("command", {}).get("data", {}).get("groups")
     groups = []
-    for g in resp.get("groups") or []:
+    for g in raw_groups or []:
         buckets = []
         for b in g.get("buckets") or []:
-            if b.get("disabled") or b.get("remainingFraction") is None:
+            rem = b.get("remainingFraction") if b.get("remainingFraction") is not None else b.get("remaining_fraction")
+            if b.get("disabled") or rem is None:
                 continue
+            b_id = b.get("bucketId") or b.get("id") or ""
+            r_time = b.get("resetTime") or b.get("reset_time") or ""
             buckets.append({
-                "bucket_id": b.get("bucketId") or "",
+                "bucket_id": b_id,
                 "window": b.get("window") or "",
-                "remaining_fraction": float(b["remainingFraction"]),
-                "reset_time": b.get("resetTime") or "",
+                "remaining_fraction": float(rem),
+                "reset_time": r_time,
             })
         if buckets:
-            groups.append({"display_name": g.get("displayName") or "", "buckets": buckets})
+            d_name = g.get("displayName") or g.get("name") or ""
+            groups.append({"display_name": d_name, "buckets": buckets})
     return groups
 
 
 def windows(reading: dict | None) -> dict[str, dict]:
     """{bucket_id: {"used": pct, "resets_at": epoch|None}} for one reading."""
+    if not reading:
+        return {}
     out: dict[str, dict] = {}
     for g in (reading or {}).get("groups") or []:
         for b in g.get("buckets") or []:
