@@ -124,6 +124,21 @@ def fetch(token: str, project: str | None = None, cred_raw: str | None = None,
     raise last or UsageError("network", "no host answered")
 
 
+MODELS_PREFIX = "models within this group:"
+
+
+def parse_models(description: str | None) -> list[str]:
+    """Model names from a group description like 'Models within this group: A, B'."""
+    if not description:
+        return []
+    low = description.lower()
+    i = low.find(MODELS_PREFIX)
+    if i < 0:
+        return []
+    tail = description[i + len(MODELS_PREFIX):].split("\n", 1)[0]
+    return [m.strip().rstrip(".") for m in tail.split(",") if m.strip().rstrip(".")]
+
+
 def normalize(resp: dict) -> list[dict]:
     raw_groups = resp.get("groups")
     if raw_groups is None and "command" in resp:
@@ -137,20 +152,30 @@ def normalize(resp: dict) -> list[dict]:
                 continue
             b_id = b.get("bucketId") or b.get("id") or ""
             r_time = b.get("resetTime") or b.get("reset_time") or ""
-            buckets.append({
+            bucket = {
                 "bucket_id": b_id,
                 "window": b.get("window") or "",
                 "remaining_fraction": float(rem),
                 "reset_time": r_time,
-            })
+            }
+            if b.get("name") or b.get("displayName"):
+                bucket["name"] = b.get("name") or b.get("displayName")
+            if b.get("description"):
+                bucket["description"] = b["description"]
+            buckets.append(bucket)
         if buckets:
             d_name = g.get("displayName") or g.get("name") or ""
-            groups.append({"display_name": d_name, "buckets": buckets})
+            group = {"display_name": d_name, "buckets": buckets}
+            desc = g.get("description") or ""
+            if desc:
+                group["description"] = desc
+                group["models"] = parse_models(desc)
+            groups.append(group)
     return groups
 
 
 def windows(reading: dict | None) -> dict[str, dict]:
-    """{bucket_id: {"used": pct, "resets_at": epoch|None}} for one reading."""
+    """{bucket_id: {"used": pct, "resets_at": epoch|None, "group": name, "window": w}}."""
     if not reading:
         return {}
     out: dict[str, dict] = {}
@@ -158,8 +183,15 @@ def windows(reading: dict | None) -> dict[str, dict]:
         for b in g.get("buckets") or []:
             used = round((1.0 - float(b.get("remaining_fraction", 1.0))) * 100.0, 1)
             out[b.get("bucket_id", "")] = {"used": max(0.0, min(100.0, used)),
-                                           "resets_at": parse_rfc3339(b.get("reset_time"))}
+                                           "resets_at": parse_rfc3339(b.get("reset_time")),
+                                           "group": g.get("display_name") or "",
+                                           "window": b.get("window") or ""}
     return out
+
+
+def has_models(reading: dict | None) -> bool:
+    """True when the reading carries group descriptions (readings before 0.3.2 did not)."""
+    return any("description" in g for g in (reading or {}).get("groups") or [])
 
 
 def in_pool(bucket_id: str, pool: str) -> bool:

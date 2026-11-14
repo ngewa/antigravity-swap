@@ -79,3 +79,61 @@ def test_instances_grouping():
     assert "Running instances:" in text
     assert "(2 sessions)" in text and "(1 session)" in text
     assert "account unknown" in text
+
+
+AGY_USAGE = {"command": {"name": "usage", "data": {"groups": [
+    {"name": "Gemini Models", "description": "Models within this group: Gemini 4 Hydrogen, Gemini 3.8 Flash",
+     "buckets": [{"id": "gemini-weekly", "name": "Weekly Limit Remaining", "window": "weekly",
+                  "remaining_fraction": 0.93, "reset_time": "2099-01-08T00:00:00Z"},
+                 {"id": "gemini-5h", "window": "5h", "remaining_fraction": 1.0,
+                  "reset_time": "2099-01-01T05:00:00Z"}]},
+    {"name": "Gemini 4 Argon", "description": "For paid Pro plans, Argon quota is separate.",
+     "buckets": [{"id": "gemini-argon-wtu-weekly", "window": "weekly", "remaining_fraction": 0,
+                  "reset_time": "2099-01-07T00:00:00Z"}]}]}}}
+
+
+def test_parse_models():
+    from antigravity_swap.usage import parse_models
+    assert parse_models("Models within this group: A 1, B-2, C.") == ["A 1", "B-2", "C"]
+    assert parse_models("For paid Pro plans, Argon quota is separate.") == []
+    assert parse_models(None) == []
+
+
+def test_normalize_keeps_models_and_extra_buckets(env, monkeypatch):
+    from antigravity_swap.usage import has_models, normalize
+    monkeypatch.setenv("NO_COLOR", "1")
+    groups = normalize(AGY_USAGE)
+    assert groups[0]["models"] == ["Gemini 4 Hydrogen", "Gemini 3.8 Flash"]
+    assert groups[0]["buckets"][0]["name"] == "Weekly Limit Remaining"
+    r = {"ts": time.time(), "project": "p", "host": "h", "groups": groups}
+    assert has_models(r) and not has_models(reading())
+
+    mgr, reg = add_accounts(env, "a@x.io")
+    put_usage(1, r)
+    out = io.StringIO()
+    views.print_tree(mgr, reg, mgr.active(reg), out)
+    assert "Gemini 4 Argon 7d:" in out.getvalue()      # unknown buckets are no longer hidden
+
+    out = io.StringIO()
+    views.print_detail(mgr, reg, mgr.active(reg), out)
+    text = out.getvalue()
+    assert "Gemini 4 Hydrogen, Gemini 3.8 Flash" in text
+    assert text.index(" 5h ") < text.index(" 7d ")           # 5h listed before 7d
+    assert "+ Gemini Models" in text or "✓ Gemini Models" in text
+    assert "Gemini 4 Argon  exhausted" in text
+    assert "Pro plans" not in text and "note:" not in text
+
+
+def test_list_detail_and_json(env, capsys, monkeypatch):
+    import json
+    from antigravity_swap.usage import normalize
+    monkeypatch.setenv("NO_COLOR", "1")
+    add_accounts(env, "a@x.io")
+    put_usage(1, {"ts": time.time(), "project": "p", "host": "h", "groups": normalize(AGY_USAGE)})
+    assert main(["list", "--detail", "--cached"]) == 0
+    assert "Gemini 4 Argon  exhausted" in capsys.readouterr().out
+    assert main(["list", "--json", "--cached"]) == 0
+    row = json.loads(capsys.readouterr().out)["accounts"][0]
+    names = {g["name"]: g for g in row["modelGroups"]}
+    assert names["Gemini Models"]["available"] is True
+    assert names["Gemini 4 Argon"]["available"] is False and names["Gemini 4 Argon"]["blockedUntil"]

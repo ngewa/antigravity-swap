@@ -7,11 +7,11 @@ from pathlib import Path
 from typing import TextIO
 
 from antigravity_swap import paths, style
-from antigravity_swap.credentials import CredentialError, FileBackend
+from antigravity_swap.credentials import CredentialError, FileBackend, parse_rfc3339
 from antigravity_swap.manager import Manager, default_account_at
 from antigravity_swap.processes import Instance, list_instances
 from antigravity_swap.store import Account, Registry
-from antigravity_swap.usage import WINDOW_ORDER, windows
+from antigravity_swap.usage import WINDOW_ORDER, has_models, windows
 
 LABELS = {
     "gemini-5h": "Gemini 5h",
@@ -19,6 +19,29 @@ LABELS = {
     "3p-5h": "Claude/GPT 5h",
     "3p-weekly": "Claude/GPT 7d",
 }
+WINDOW_SHORT = {"weekly": "7d", "5h": "5h", "daily": "1d"}
+
+
+def window_short(window: str, bucket_id: str = "") -> str:
+    if window in WINDOW_SHORT:
+        return WINDOW_SHORT[window]
+    if bucket_id.endswith("weekly"):
+        return "7d"
+    if bucket_id.endswith("5h"):
+        return "5h"
+    return window or "?"
+
+
+def bucket_label(bucket_id: str, w: dict) -> str:
+    """Known buckets keep their short label; new ones (e.g. Gemini 4 Argon) use group + window."""
+    if bucket_id in LABELS:
+        return LABELS[bucket_id]
+    group = w.get("group") or bucket_id
+    return f"{group} {window_short(w.get('window', ''), bucket_id)}"
+
+
+def ordered_buckets(w: dict) -> list[str]:
+    return [b for b in WINDOW_ORDER if b in w] + [b for b in w if b not in WINDOW_ORDER]
 
 
 def fmt_reset(ts: float | None, now: float | None = None) -> str:
@@ -96,15 +119,15 @@ def print_tree(mgr: Manager, reg: Registry, active: Account | None, out: TextIO,
         name = style.active(account_name(a)) if is_active else account_name(a)
         out.write("  " + " ".join([f"{a.slot}: {name}"] + _header_bits(mgr, a, is_active, now)) + "\n")
         w = windows(mgr.cached(a).get("reading"))
-        rows = [b for b in WINDOW_ORDER if b in w]
+        rows = ordered_buckets(w)
         if not rows:
             out.write(f"     {style.dim(g['end'])} {style.dim(f'no quota reading yet (aswap refresh {a.slot})')}\n")
             continue
-        width = max(len(LABELS[b]) for b in rows) + 1
+        width = max(len(bucket_label(b, w[b])) for b in rows) + 1
         for i, b in enumerate(rows):
             tree = style.dim(g["end"] if i == len(rows) - 1 else g["mid"])
             used, resets = w[b]["used"], w[b]["resets_at"]
-            label = (LABELS[b] + ":").ljust(width)
+            label = (bucket_label(b, w[b]) + ":").ljust(width)
             if used <= 0:
                 tail = style.dim("full")
             else:
@@ -116,6 +139,87 @@ def print_tree(mgr: Manager, reg: Registry, active: Account | None, out: TextIO,
         if cred is not None:
             out.write(f"\n{style.warn('The current agy login')} ({cred.identity().email or 'unknown'}) "
                       f"is not managed. Run: aswap add\n")
+
+
+# --- detailed view: quota per model group ------------------------------------------------
+
+
+WINDOW_RANK = {"5h": 0, "1d": 1, "7d": 2}
+
+
+def group_rows(reading: dict | None) -> list[dict]:
+    """One entry per model group: name, models, buckets with used %, and availability."""
+    rows = []
+    for grp in (reading or {}).get("groups") or []:
+        buckets = []
+        for b in grp.get("buckets") or []:
+            used = round((1.0 - float(b.get("remaining_fraction", 1.0))) * 100.0, 1)
+            buckets.append({"id": b.get("bucket_id", ""),
+                            "window": window_short(b.get("window", ""), b.get("bucket_id", "")),
+                            "used": max(0.0, min(100.0, used)),
+                            "resets_at": parse_rfc3339(b.get("reset_time"))})
+        buckets.sort(key=lambda b: WINDOW_RANK.get(b["window"], 9))
+        out_of = [b for b in buckets if b["used"] >= 100.0]
+        blocked_until = max((b["resets_at"] for b in out_of if b["resets_at"]), default=None)
+        rows.append({"name": grp.get("display_name") or "?",
+                     "models": grp.get("models") or [],
+                     "available": not out_of,
+                     "blocked_until": blocked_until,
+                     "buckets": buckets})
+    return rows
+
+
+def _bar(used: float, width: int = 10) -> str:
+    fill, empty = ("█", "░") if style.glyphs()["mid"] == "├" else ("#", "-")
+    n = int(round(used / 100.0 * width))
+    text = fill * n + empty * (width - n)
+    if used >= 90:
+        return style.bad(text)
+    if used >= 70:
+        return style.warn(text)
+    return style.good(text)
+
+
+def print_detail(mgr: Manager, reg: Registry, active: Account | None, out: TextIO) -> None:
+    unicode = style.glyphs()["mid"] == "├"
+    ok_mark, no_mark = ("✓", "✗") if unicode else ("+", "x")
+    now = time.time()
+    accts = reg.ordered()
+    if not accts:
+        out.write("No accounts yet. Sign in with agy, then run: aswap add\n")
+        return
+    for ai, a in enumerate(accts):
+        if ai:
+            out.write("\n")
+        is_active = bool(active and active.slot == a.slot)
+        name = style.active(account_name(a)) if is_active else style.bold(account_name(a))
+        out.write(" ".join([f"{a.slot}: {name}"] + _header_bits(mgr, a, is_active, now)) + "\n")
+        reading = mgr.cached(a).get("reading")
+        groups = group_rows(reading)
+        if not groups:
+            out.write(f"   {style.dim(f'no quota reading yet (aswap refresh {a.slot})')}\n")
+            continue
+        whens = [fmt_reset(b["resets_at"], now) for grp in groups for b in grp["buckets"]
+                 if b["used"] > 0 and b["resets_at"]]
+        when_w = max((len(w) for w in whens), default=0)
+        for grp in groups:
+            if grp["available"]:
+                out.write(f"   {style.good(ok_mark)} {style.bold(grp['name'])}\n")
+            else:
+                out.write(f"   {style.bad(no_mark)} {style.bold(grp['name'])}  {style.bad('exhausted')}\n")
+            if grp["models"]:
+                out.write(f"     {style.dim(', '.join(grp['models']))}\n")
+            for b in grp["buckets"]:
+                if b["used"] <= 0:
+                    tail = style.dim("full")
+                elif b["resets_at"]:
+                    when = fmt_reset(b["resets_at"], now).ljust(when_w)
+                    tail = f"resets {when}  {style.dim('in ' + fmt_in(b['resets_at'] - now))}"
+                else:
+                    tail = ""
+                out.write(f"     {b['window']:<3} {_bar(b['used'])} {style.pct(b['used'])}  {tail}".rstrip() + "\n")
+        if not has_models(reading):
+            out.write(style.dim("   (model names appear after a fresh reading: aswap list --detail --refresh)\n"))
 
 
 # --- running instances -------------------------------------------------------------------

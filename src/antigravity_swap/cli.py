@@ -21,7 +21,7 @@ from antigravity_swap.manager import Manager, SwitchError, with_registry
 from antigravity_swap.settings import KEYS, PICK_STRATEGIES, POOLS, STRATEGIES, Settings
 from antigravity_swap.settings import strategy as strategy_name
 from antigravity_swap.store import Registry, StoreError, capture, load_cred, save_cred
-from antigravity_swap.usage import WINDOW_ORDER, windows
+from antigravity_swap.usage import WINDOW_ORDER, has_models, windows
 
 SCHEMA = 1
 
@@ -89,6 +89,14 @@ def account_row(mgr: Manager, a, active, now) -> dict:
                       "resetsAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(v["resets_at"]))
                       if v["resets_at"] else None} for k, v in w.items()} or None,
     }
+    groups = views.group_rows(reading)
+    if groups:
+        row["modelGroups"] = [{
+            "name": grp["name"], "models": grp["models"], "available": grp["available"],
+            "blockedUntil": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(grp["blocked_until"]))
+            if grp["blocked_until"] else None,
+            "buckets": [b["id"] for b in grp["buckets"]],
+        } for grp in groups]
     age = mgr.usage_age(a)
     if age is not None:
         row["usageAgeSeconds"] = round(age)
@@ -162,7 +170,9 @@ def cmd_list(mgr, args):
             for a in reg.ordered():
                 if a.disabled:
                     continue
-                mgr.refresh_usage(reg, a, force=args.refresh, active=active)
+                # --detail needs model names, which readings saved before 0.3.2 lack
+                stale_shape = args.detail and not has_models(mgr.cached(a).get("reading"))
+                mgr.refresh_usage(reg, a, force=args.refresh or stale_shape, active=active)
         reg.save()
     instances = views.instance_rows(mgr, reg, active)
     if args.json:
@@ -173,6 +183,9 @@ def cmd_list(mgr, args):
                           "runningInstances": instances}, indent=2))
     elif args.table:
         print_table(mgr, reg, active)
+    elif args.detail:
+        views.print_detail(mgr, reg, active, sys.stdout)
+        views.print_instances(instances, sys.stdout)
     else:
         views.print_tree(mgr, reg, active, sys.stdout)
         views.print_instances(instances, sys.stdout)
@@ -590,6 +603,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--refresh", action="store_true", help="fetch fresh quota for every account")
     s.add_argument("--cached", action="store_true", help="no network; show the last readings")
     s.add_argument("--table", action="store_true", help="one compact row per account")
+    s.add_argument("-d", "--detail", action="store_true",
+                   help="quota per model group, with the models in each group and whether they are usable")
 
     s = sub.add_parser("status", help="which account agy is using")
     s.add_argument("--json", action="store_true")
