@@ -532,12 +532,16 @@ def cmd_watch(mgr, args):
                 active = mgr.capture_active(reg)
                 for a in reg.ordered():
                     if not a.disabled:
-                        mgr.refresh_usage(reg, a, active=active, max_age=args.interval)
+                        stale_shape = not args.compact and not has_models(mgr.cached(a).get("reading"))
+                        mgr.refresh_usage(reg, a, force=stale_shape, active=active, max_age=args.interval)
                 reg.save()
             if sys.stdout.isatty():
                 sys.stdout.write("\033[2J\033[H")
             print(f"aswap watch  {time.strftime('%H:%M:%S')}  (every {args.interval:.0f}s, Ctrl-C stops)\n")
-            views.print_tree(mgr, reg, active, sys.stdout)
+            if args.compact:
+                views.print_tree(mgr, reg, active, sys.stdout)
+            else:
+                views.print_detail(mgr, reg, active, sys.stdout)
             views.print_instances(views.instance_rows(mgr, reg, active), sys.stdout)
             sys.stdout.flush()
             time.sleep(args.interval)
@@ -650,6 +654,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("watch", help="live quota table")
     s.add_argument("--interval", type=float, default=60.0)
+    s.add_argument("--detail", action="store_true", help="show per-group model list and progress bars (default)")
+    s.add_argument("--compact", action="store_true", help="show compact tree view instead of detailed view")
 
     s = sub.add_parser("refresh", help="renew tokens and fetch quota now")
     s.add_argument("target", nargs="?")
